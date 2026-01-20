@@ -1,12 +1,12 @@
-name: Build-Bin-Cua-Tui
-on: [workflow_dispatch] # Để hiện nút bấm Build bằng tay
+name: Build-Bin-Moi-Nhat
+on: [workflow_dispatch]
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # Cập nhật v4
 
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v1
@@ -18,11 +18,11 @@ jobs:
 
       - name: Compile và Build file .bin
         run: |
-          # Chỗ này nó sẽ tìm file main.ino ở thư mục gốc để dịch
+          # Nó sẽ tìm file main.ino ở thư mục gốc
           arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 ./main.ino --output-dir ./build
 
       - name: Luu file .bin vao Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4 # Sửa lỗi thành v4 ở đây
         with:
           name: Firmware-Sniffer-Cua-Tui
           path: ./build/*.bin
