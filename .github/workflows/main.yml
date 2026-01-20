@@ -18,8 +18,9 @@ jobs:
 
       - name: Compile và Build file .bin
         run: |
-          # Nó sẽ tìm file main.ino ở thư mục gốc
-          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 ./main.ino --output-dir ./build
+          # Dấu chấm (.) báo cho GitHub biết file .ino nằm ngay ở thư mục gốc
+          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 . --output-dir ./build
+          
 
       - name: Luu file .bin vao Artifacts
         uses: actions/upload-artifact@v4 # Sửa lỗi thành v4 ở đây
