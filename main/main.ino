@@ -4,7 +4,7 @@ extern "C" {
   #include "user_interface.h"
 }
 
-// Cấu trúc điều khiển gói tin
+// Cấu trúc gói tin từ SDK
 struct RxControl {
   signed rssi: 8;
   unsigned rate: 4;
@@ -38,45 +38,50 @@ struct SnifferPacket {
   uint16_t len;
 };
 
-// Hàm callback xử lý dữ liệu khi bắt được gói tin
+// Hàm xử lý khi bắt được BẤT KỲ gói tin nào
 void sniffer_callback(uint8_t *buffer, uint16_t length) {
   struct SnifferPacket *packet = (struct SnifferPacket *)buffer;
   
-  // Kiểm tra gói tin EAPOL (Handshake - 0x888E)
-  if (packet->data[32] == 0x88 && packet->data[33] == 0x8e) {
-    Serial.println("\n[!] PHÁT HIỆN HANDSHAKE TRÊN KÊNH 5!");
-    Serial.printf("RSSI: %d | Độ dài: %d\n", packet->rx_ctrl.rssi, length);
-    
-    for (int i = 0; i < length; i++) {
-      Serial.printf("%02X", packet->data[i]);
-    }
-    Serial.println();
+  // Lấy loại gói tin (Frame Control)
+  uint8_t frameType = packet->data[0];
+  uint8_t frameSubType = (frameType & 0xF0) >> 4;
+  
+  // In thông tin tóm tắt để không làm treo chip
+  Serial.printf("[Ch:5][RSSI:%4d][Len:%4d] Type: 0x%02X | Sub: 0x%X ", 
+                packet->rx_ctrl.rssi, length, frameType, frameSubType);
+
+  // Nhận diện nhanh một số loại gói quan trọng
+  if (frameType == 0x80) Serial.print("-> BEACON");
+  if (packet->data[32] == 0x88 && packet->data[33] == 0x8e) Serial.print(" -> !!! HANDSHAKE !!!");
+  
+  Serial.println();
+
+  /* // NẾU MUỐN XEM FULL HEX (Cẩn thận: Dễ gây treo nếu có quá nhiều wifi xung quanh)
+  for (int i = 0; i < length; i++) {
+    Serial.printf("%02X ", packet->data[i]);
   }
+  Serial.println();
+  */
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Tăng tốc độ Serial lên mức tối đa để tránh nghẽn dữ liệu
+  Serial.begin(230400); 
   delay(500);
 
-  // Chế độ Station
   wifi_set_opmode(STATION_MODE);
-  
-  // Tắt promiscuous để cấu hình
   wifi_promiscuous_enable(0);
-  
-  // Thiết lập hàm callback
   wifi_set_promiscuous_rx_cb(sniffer_callback);
   
-  // QUAN TRỌNG: Cố định kênh 5 tại đây
+  // Cố định kênh 5
   wifi_set_channel(5); 
   
-  // Bật chế độ sniffer
   wifi_promiscuous_enable(1);
   
-  Serial.println("--- SNIFFER ĐANG CHẠY: CỐ ĐỊNH KÊNH 5 ---");
+  Serial.println("\n--- ĐANG QUÉT TOÀN BỘ GÓI TIN TRÊN KÊNH 5 ---");
 }
 
 void loop() {
-  // Không cần nhảy kênh, giữ trống loop hoặc dùng để duy trì hệ thống
-  delay(1); 
+  // Để trống để ưu tiên tài nguyên cho Sniffer
+  delay(1);
 }
