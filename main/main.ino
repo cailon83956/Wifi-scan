@@ -4,84 +4,48 @@ extern "C" {
   #include "user_interface.h"
 }
 
-// Cấu trúc gói tin từ SDK
-struct RxControl {
-  signed rssi: 8;
-  unsigned rate: 4;
-  unsigned is_group: 1;
-  unsigned: 1;
-  unsigned sig_mode: 2;
-  unsigned legacy_length: 12;
-  unsigned damatch0: 1;
-  unsigned damatch1: 1;
-  unsigned bssidmatch0: 1;
-  unsigned bssidmatch1: 1;
-  unsigned MCS: 7;
-  unsigned CWB: 1;
-  unsigned HT_length: 16;
-  unsigned Smoothing: 1;
-  unsigned Not_Sounding: 1;
-  unsigned: 1;
-  unsigned Aggregation: 1;
-  unsigned STBC: 2;
-  unsigned FEC_CODING: 1;
-  unsigned SGI: 1;
-  unsigned rx_end_callback_time: 32;
-  unsigned snr: 8;
-  unsigned: 0;
-};
+// Hàm callback xử lý gói tin bắt được
+void sniffer_callback(uint8_t *buf, uint16_t len) {
+  if (len == 0) return;
 
-struct SnifferPacket {
-  struct RxControl rx_ctrl;
-  uint8_t data[512];
-  uint16_t cnt;
-  uint16_t len;
-};
-
-// Hàm xử lý khi bắt được BẤT KỲ gói tin nào
-void sniffer_callback(uint8_t *buffer, uint16_t length) {
-  struct SnifferPacket *packet = (struct SnifferPacket *)buffer;
+  // Cấu trúc gói tin thô (raw packet)
+  // buf[0] thường chứa thông tin về loại gói tin (Frame Control)
   
-  // Lấy loại gói tin (Frame Control)
-  uint8_t frameType = packet->data[0];
-  uint8_t frameSubType = (frameType & 0xF0) >> 4;
+  Serial.print("Packet length: ");
+  Serial.print(len);
   
-  // In thông tin tóm tắt để không làm treo chip
-  Serial.printf("[Ch:5][RSSI:%4d][Len:%4d] Type: 0x%02X | Sub: 0x%X ", 
-                packet->rx_ctrl.rssi, length, frameType, frameSubType);
-
-  // Nhận diện nhanh một số loại gói quan trọng
-  if (frameType == 0x80) Serial.print("-> BEACON");
-  if (packet->data[32] == 0x88 && packet->data[33] == 0x8e) Serial.print(" -> !!! HANDSHAKE !!!");
-  
-  Serial.println();
-
-  /* // NẾU MUỐN XEM FULL HEX (Cẩn thận: Dễ gây treo nếu có quá nhiều wifi xung quanh)
-  for (int i = 0; i < length; i++) {
-    Serial.printf("%02X ", packet->data[i]);
+  // In 6 byte địa chỉ MAC nguồn (thường nằm ở offset 10 trong gói tin 802.11)
+  if (len > 16) {
+    Serial.print(" | SRC MAC: ");
+    for (int i = 10; i < 16; i++) {
+      Serial.printf("%02X", buf[i]);
+      if (i < 15) Serial.print(":");
+    }
   }
   Serial.println();
-  */
 }
 
 void setup() {
-  // Tăng tốc độ Serial lên mức tối đa để tránh nghẽn dữ liệu
-  Serial.begin(230400); 
-  delay(500);
+  Serial.begin(115200);
+  delay(1000);
 
-  wifi_set_opmode(STATION_MODE);
-  wifi_promiscuous_enable(0);
-  wifi_set_promiscuous_rx_cb(sniffer_callback);
+  // 1. Chuyển sang chế độ Station nhưng không kết nối vào mạng nào
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  // 2. Kích hoạt chế độ Promiscuous (Monitor Mode)
+  wifi_promiscuous_enable(0); // Tắt trước khi cài đặt
+  wifi_set_promiscuous_rx_cb(sniffer_callback); // Đặt hàm xử lý
+  wifi_promiscuous_enable(1); // Bật lại
+
+  // 3. Cố định kênh 5
+  wifi_set_channel(5);
   
-  // Cố định kênh 5
-  wifi_set_channel(5); 
-  
-  wifi_promiscuous_enable(1);
-  
-  Serial.println("\n--- ĐANG QUÉT TOÀN BỘ GÓI TIN TRÊN KÊNH 5 ---");
+  Serial.println("--- Đang Monitor trên Kênh 5 ---");
+  Serial.printf("CPU Frequency: %d MHz\n", ESP.getCpuFreqMHz());
 }
 
 void loop() {
-  // Để trống để ưu tiên tài nguyên cho Sniffer
-  delay(1);
+  // Không cần viết gì ở loop vì hàm sniffer_callback sẽ tự chạy khi có gói tin
+  delay(1); 
 }
