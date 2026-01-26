@@ -1,16 +1,16 @@
-name: Build ESP8266
+name: Build and Direct Link
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch: # Cho phép bấm chạy thủ công
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Quan trọng: Để GitHub có quyền tạo Release
 
 jobs:
-  compile:
+  build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,12 +25,17 @@ jobs:
 
       - name: Compile Sketch
         run: |
-          # Lệnh này trỏ vào thư mục "main" mà bạn đã tạo
-          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 ./main
+          # Xuất file .bin ra thư mục 'output'
+          mkdir output
+          arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 ./main --output-dir ./output
 
-      - name: Upload Firmware
-        uses: actions/upload-artifact@v4
+      - name: Create Release and Upload Bin
+        uses: softprops/action-gh-release@v2
         with:
-          name: ESP8266-Binaries
-          path: main/*.bin
+          tag_name: latest
+          name: "Latest Firmware Build"
+          files: output/*.bin
+          body: "Bấm vào file .bin bên dưới để tải trực tiếp!"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           
