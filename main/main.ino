@@ -1,76 +1,119 @@
 #include <ESP8266WiFi.h>
-
 extern "C" {
-  #include "user_interface.h"  // Cần cho promiscuous
+  #include "user_interface.h"
 }
 
-#define FIXED_CHANNEL 5
-#define SERIAL_BAUD 115200
+/* ===== 802.11 MAC header (24 bytes, non-QoS) ===== */
+typedef struct {
+  uint16_t frame_ctrl;
+  uint16_t duration;
+  uint8_t addr1[6];
+  uint8_t addr2[6];
+  uint8_t addr3[6];
+  uint16_t seq_ctrl;
+} __attribute__((packed)) wifi_ieee80211_mac_hdr_t;
 
-uint32_t eapol_count = 0;
+/* ===== LLC + SNAP ===== */
+typedef struct {
+  uint8_t dsap;
+  uint8_t ssap;
+  uint8_t control;
+  uint8_t oui[3];
+  uint16_t ethertype;
+} __attribute__((packed)) llc_snap_hdr_t;
 
-static void ICACHE_FLASH_ATTR promisc_cb(uint8_t *buf, uint16_t len) {
-  if (len < 50) return;
+/* ===== EAPOL header ===== */
+typedef struct {
+  uint8_t version;
+  uint8_t type;
+  uint16_t length;
+} __attribute__((packed)) eapol_hdr_t;
 
-  int8_t rssi = (int8_t)buf[1];  // RSSI signed
+/* ===== Promiscuous callback ===== */
+static void promisc_cb(uint8_t *buf, uint16_t len) {
 
-  // Tìm EAPOL: 0x88 0x8E
-  for (uint16_t i = 10; i < len - 4; i++) {
-    if (buf[i] == 0x88 && buf[i + 1] == 0x8E) {
-      eapol_count++;
-      uint16_t eapol_offset = i;
-      uint16_t eapol_len = len - eapol_offset;
+  if (len < 60) return;
 
-      Serial.println();
-      Serial.printf("=== EAPOL #%u DETECTED! Total Len=%u | EAPOL approx=%u | RSSI=%d dBm | Ch=%d ===\n",
-                    eapol_count, len, eapol_len, rssi, FIXED_CHANNEL);
+  /* --- RX control (ESP8266: 12 bytes) --- */
+  struct RxControl *rx = (struct RxControl *)buf;
+  int8_t rssi = rx->rssi;
 
-      // Dump hex dài hơn (tối đa 250 bytes)
-      Serial.print("Hex dump: ");
-      uint16_t dump_len = min((uint16_t)250, len);
-      for (uint16_t j = 0; j < dump_len; j++) {
-        if (buf[j] < 16) Serial.print("0");
-        Serial.print(buf[j], HEX);
-        Serial.print(" ");
-        if ((j + 1) % 16 == 0) Serial.print("  ");
-      }
-      Serial.println();
+  uint8_t *payload = buf + sizeof(struct RxControl);
+  uint16_t payload_len = len - sizeof(struct RxControl);
 
-      if (eapol_len > 95) {
-        Serial.println("!!! CO THE LA FULL MESSAGE (len >95) - Copy hex de convert Hashcat !!!");
-      }
+  if (payload_len < sizeof(wifi_ieee80211_mac_hdr_t) + sizeof(llc_snap_hdr_t))
+    return;
 
-      return;
-    }
+  /* --- 802.11 MAC --- */
+  wifi_ieee80211_mac_hdr_t *mac =
+      (wifi_ieee80211_mac_hdr_t *)payload;
+
+  uint16_t fc = mac->frame_ctrl;
+
+  /* Chỉ xử lý DATA frame */
+  if ((fc & 0x000C) != 0x0008) return;
+
+  bool toDS   = fc & (1 << 8);
+  bool fromDS = fc & (1 << 9);
+
+  int mac_len = 24;
+  if (toDS && fromDS) mac_len = 30;   // Addr4
+  if (fc & 0x0080) mac_len += 2;       // QoS
+
+  if (payload_len < mac_len + sizeof(llc_snap_hdr_t))
+    return;
+
+  /* --- LLC / SNAP --- */
+  llc_snap_hdr_t *llc =
+      (llc_snap_hdr_t *)(payload + mac_len);
+
+  if (llc->dsap != 0xAA || llc->ssap != 0xAA) return;
+  if (llc->ethertype != htons(0x888E)) return;  // EAPOL
+
+  /* --- EAPOL --- */
+  eapol_hdr_t *eapol =
+      (eapol_hdr_t *)(payload + mac_len + sizeof(llc_snap_hdr_t));
+
+  uint16_t eapol_len = ntohs(eapol->length);
+  uint16_t eapol_total = sizeof(eapol_hdr_t) + eapol_len;
+
+  if (payload_len < mac_len + sizeof(llc_snap_hdr_t) + eapol_total)
+    return;
+
+  /* --- OUTPUT --- */
+  Serial.println("\n===== EAPOL DETECTED =====");
+  Serial.printf("RSSI: %d dBm\n", rssi);
+  Serial.printf("EAPOL type: %u\n", eapol->type);
+  Serial.printf("EAPOL length: %u\n", eapol_len);
+
+  uint8_t *raw = (uint8_t *)eapol;
+  Serial.print("EAPOL hex: ");
+  for (int i = 0; i < eapol_total; i++) {
+    if (raw[i] < 16) Serial.print("0");
+    Serial.print(raw[i], HEX);
+    Serial.print(" ");
   }
+  Serial.println();
 }
 
+/* ===== SETUP ===== */
 void setup() {
-  Serial.begin(SERIAL_BAUD);
-  delay(500);
-  Serial.println("\nESP8266 Sniffer EAPOL Handshake - Channel 5 FIXED");
-  Serial.println("Cho client reconnect de tao handshake...");
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true);
-  delay(200);
+  Serial.begin(115200);
+  Serial.println();
 
   wifi_set_opmode(STATION_MODE);
   wifi_promiscuous_enable(0);
-  delay(100);
 
-  wifi_set_channel(FIXED_CHANNEL);
+  /* ===== FIX CHANNEL 11 ===== */
+  wifi_set_channel(11);
+
   wifi_set_promiscuous_rx_cb(promisc_cb);
   wifi_promiscuous_enable(1);
 
-  Serial.printf("Sniffing bat dau tren channel %d...\n", FIXED_CHANNEL);
+  Serial.println("ESP8266 sniffing EAPOL on CHANNEL 11");
 }
 
+/* ===== LOOP ===== */
 void loop() {
-  static uint32_t last_print = 0;
-  if (millis() - last_print > 10000) {
-    last_print = millis();
-    Serial.printf("[INFO] Da bat %u EAPOL frames\n", eapol_count);
-  }
-  delay(10);
+  // Không cần làm gì
 }
